@@ -1,442 +1,397 @@
-// Instagram Downloader Backend - Node.js + Express
-// File: server.js
-
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const cheerio = require("cheerio");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = 3001;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public"));
 
-// Rate limiting (simple implementation)
-const requestCounts = new Map();
-const RATE_LIMIT = 10; // requests per minute
-const RATE_WINDOW = 60000; // 1 minute
+// User agent to mimic a real browser
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-function rateLimit(req, res, next) {
-  const clientIP = req.ip;
-  const now = Date.now();
-
-  if (!requestCounts.has(clientIP)) {
-    requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
-  } else {
-    const clientData = requestCounts.get(clientIP);
-    if (now > clientData.resetTime) {
-      clientData.count = 1;
-      clientData.resetTime = now + RATE_WINDOW;
-    } else {
-      clientData.count++;
-    }
-
-    if (clientData.count > RATE_LIMIT) {
-      return res
-        .status(429)
-        .json({ error: "Rate limit exceeded. Try again later." });
-    }
-  }
-
-  next();
-}
-
-// Utility function to validate Instagram URL
-function validateInstagramUrl(url) {
-  const instagramRegex =
-    /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv)\/([A-Za-z0-9_-]+)\/?/;
-  return instagramRegex.test(url);
-}
-
-// Method 1: Extract using Instagram's embed endpoint
-async function extractFromEmbed(instagramUrl) {
+// Function to extract full resolution image from Instagram
+async function extractInstagramImage(url) {
   try {
-    const postId = instagramUrl.match(/\/([A-Za-z0-9_-]+)\/?$/)[1];
-    const embedUrl = `https://www.instagram.com/p/${postId}/embed/captioned/`;
+    // Extract post ID from URL
+    const postIdMatch = url.match(/\/p\/([A-Za-z0-9_-]+)/);
+    if (!postIdMatch) {
+      throw new Error("Could not extract post ID from URL");
+    }
+    const postId = postIdMatch[1];
 
-    console.log(`Trying embed URL: ${embedUrl}`);
+    console.log(`Extracting post ID: ${postId}`);
 
-    const response = await axios.get(embedUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Cache-Control": "no-cache",
-      },
-      timeout: 10000,
-    });
+    // Method 1: Try Instagram's embed API first (most reliable)
+    try {
+      const embedUrl = `https://www.instagram.com/p/${postId}/embed/`;
+      const embedResponse = await axios.get(embedUrl, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          Referer: "https://www.instagram.com/",
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout: 10000,
+      });
 
-    const $ = cheerio.load(response.data);
+      const embedHtml = embedResponse.data;
+      const $embed = cheerio.load(embedHtml);
 
-    // Look for image in various places
-    let imageUrl = null;
-
-    // Method 1: Look for img tags with srcset or src
-    $("img").each((i, elem) => {
-      const srcset = $(elem).attr("srcset");
-      const src = $(elem).attr("src");
-
-      if (srcset && srcset.includes(".jpg")) {
-        // Extract highest resolution from srcset
-        const urls = srcset.split(",").map((s) => s.trim().split(" ")[0]);
-        imageUrl = urls[urls.length - 1]; // Usually the highest resolution
-        return false;
-      } else if (
-        src &&
-        (src.includes(".jpg") || src.includes(".jpeg")) &&
-        !src.includes("profile")
-      ) {
-        imageUrl = src;
-        return false;
+      // Look for the main image in embed
+      const embedImg = $embed('img[src*="scontent"]').first();
+      if (embedImg.length > 0) {
+        const embedImgSrc = embedImg.attr("src");
+        if (
+          embedImgSrc &&
+          !embedImgSrc.includes("150x150") &&
+          !embedImgSrc.includes("240x240")
+        ) {
+          console.log("Found image via embed method:", embedImgSrc);
+          return {
+            imageUrl: embedImgSrc,
+            fullImageUrl: embedImgSrc,
+            highResUrl: embedImgSrc,
+            dimensions: extractDimensionsFromUrl(embedImgSrc),
+            method: "embed",
+            success: true,
+          };
+        }
       }
-    });
-
-    if (!imageUrl) {
-      // Look for meta tags
-      imageUrl = $('meta[property="og:image"]').attr("content");
+    } catch (embedError) {
+      console.log("Embed method failed, trying direct method...");
     }
 
-    console.log(`Embed extraction result: ${imageUrl}`);
-    return imageUrl;
-  } catch (error) {
-    console.error("Embed extraction error:", error.message);
-    throw new Error("Failed to extract from embed: " + error.message);
-  }
-}
-
-// Method 2: Extract using direct page scraping
-async function extractFromPage(instagramUrl) {
-  try {
-    console.log(`Trying page scraping: ${instagramUrl}`);
-
-    const response = await axios.get(instagramUrl, {
+    // Method 2: Direct page request with exact browser simulation
+    const response = await axios.get(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": USER_AGENT,
         Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         Connection: "keep-alive",
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Cache-Control": "no-cache",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "sec-ch-ua":
+          '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
       },
       timeout: 15000,
     });
 
     const html = response.data;
-    console.log(`Page response length: ${html.length}`);
-
-    // Method 1: Look for meta tags first (most reliable)
     const $ = cheerio.load(html);
-    let imageUrl = $('meta[property="og:image"]').attr("content");
 
-    if (imageUrl) {
-      console.log(`Found og:image: ${imageUrl}`);
-      return imageUrl;
+    // Method 3: Look for the exact same image that browser displays
+    let imageUrl = null;
+    let dimensions = { width: 0, height: 0 };
+    let method = "unknown";
+
+    // First, try to find the main content image (the one browser shows)
+    const mainImages = $('img[src*="scontent"]');
+    let bestImage = null;
+    let maxScore = 0;
+
+    mainImages.each((i, elem) => {
+      const src = $(elem).attr("src");
+      const alt = $(elem).attr("alt") || "";
+      const className = $(elem).attr("class") || "";
+
+      if (src && !src.includes("stories") && !src.includes("profile")) {
+        // Score images based on how likely they are to be the main post image
+        let score = 0;
+        const dims = extractDimensionsFromUrl(src);
+
+        // Higher score for larger images
+        score += (dims.width * dims.height) / 1000000; // Million pixels = 1 point
+
+        // Higher score for square or landscape images (typical post ratios)
+        const ratio = dims.width / dims.height;
+        if (ratio >= 0.8 && ratio <= 1.25) score += 10; // Square-ish
+        if (ratio > 1.25 && ratio <= 2) score += 8; // Landscape
+
+        // Higher score for images with post-related attributes
+        if (
+          alt.toLowerCase().includes("photo") ||
+          alt.toLowerCase().includes("image")
+        )
+          score += 5;
+        if (className.includes("_image") || className.includes("post"))
+          score += 5;
+
+        // Penalty for tiny images (likely thumbnails)
+        if (dims.width < 400 || dims.height < 400) score -= 20;
+
+        // Bonus for very high resolution
+        if (dims.width >= 1080 || dims.height >= 1080) score += 15;
+
+        console.log(
+          `Image candidate: ${src.substring(0, 60)}... Score: ${score}, Dims: ${
+            dims.width
+          }x${dims.height}`
+        );
+
+        if (score > maxScore) {
+          maxScore = score;
+          bestImage = src;
+          dimensions = dims;
+          method = "main-image-detection";
+        }
+      }
+    });
+
+    if (bestImage) {
+      imageUrl = bestImage;
     }
 
-    // Method 2: Look for twitter:image
-    imageUrl = $('meta[name="twitter:image"]').attr("content");
-    if (imageUrl) {
-      console.log(`Found twitter:image: ${imageUrl}`);
-      return imageUrl;
-    }
+    // Method 4: Extract from Instagram's JSON data structures
+    if (!imageUrl) {
+      const scriptTags = $("script");
+      scriptTags.each((i, elem) => {
+        const scriptContent = $(elem).html();
 
-    // Method 3: Extract from JavaScript data
-    const scriptRegex = /window\._sharedData\s*=\s*({.+?});/;
-    const match = html.match(scriptRegex);
+        // Look for window._sharedData or similar Instagram data
+        if (
+          scriptContent &&
+          (scriptContent.includes("window._sharedData") ||
+            scriptContent.includes('"display_url"'))
+        ) {
+          try {
+            // Method 4a: window._sharedData
+            const sharedDataMatch = scriptContent.match(
+              /window\._sharedData\s*=\s*({.*?});/
+            );
+            if (sharedDataMatch) {
+              const sharedData = JSON.parse(sharedDataMatch[1]);
+              const entryData =
+                sharedData?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
 
-    if (match) {
-      try {
-        const jsonData = JSON.parse(match[1]);
-        if (jsonData.entry_data && jsonData.entry_data.PostPage) {
-          const media = jsonData.entry_data.PostPage[0].graphql.shortcode_media;
-          if (media && media.display_url) {
-            console.log(`Found from _sharedData: ${media.display_url}`);
-            return media.display_url;
+              if (entryData) {
+                // Get the main display URL (this is what Instagram shows in browser)
+                if (entryData.display_url) {
+                  imageUrl = entryData.display_url;
+                  dimensions = {
+                    width: entryData.dimensions?.width || 0,
+                    height: entryData.dimensions?.height || 0,
+                  };
+                  method = "shared-data-display-url";
+                  console.log("Found display_url from _sharedData:", imageUrl);
+                }
+
+                // Also check display_resources for even higher resolution
+                if (
+                  entryData.display_resources &&
+                  entryData.display_resources.length > 0
+                ) {
+                  const highestRes = entryData.display_resources.reduce(
+                    (max, current) => {
+                      return current.config_width * current.config_height >
+                        max.config_width * max.config_height
+                        ? current
+                        : max;
+                    }
+                  );
+
+                  // Only use if it's significantly higher resolution
+                  if (
+                    highestRes.config_width > dimensions.width ||
+                    highestRes.config_height > dimensions.height
+                  ) {
+                    imageUrl = highestRes.src;
+                    dimensions = {
+                      width: highestRes.config_width,
+                      height: highestRes.config_height,
+                    };
+                    method = "shared-data-highest-res";
+                    console.log(
+                      "Found higher resolution from display_resources:",
+                      imageUrl
+                    );
+                  }
+                }
+              }
+            }
+
+            // Method 4b: Direct JSON parsing for display_url patterns
+            if (!imageUrl) {
+              const displayUrlMatches = scriptContent.match(
+                /"display_url":"([^"]+)"/g
+              );
+              if (displayUrlMatches) {
+                const urls = displayUrlMatches
+                  .map((match) => {
+                    const urlMatch = match.match(/"display_url":"([^"]+)"/);
+                    return urlMatch
+                      ? urlMatch[1].replace(/\\u0026/g, "&").replace(/\\/g, "")
+                      : null;
+                  })
+                  .filter(Boolean);
+
+                if (urls.length > 0) {
+                  // Get the URL with the best dimensions
+                  const urlsWithDims = urls.map((url) => ({
+                    url,
+                    dims: extractDimensionsFromUrl(url),
+                    score:
+                      extractDimensionsFromUrl(url).width *
+                      extractDimensionsFromUrl(url).height,
+                  }));
+
+                  const bestUrl = urlsWithDims.reduce((max, current) => {
+                    return current.score > max.score ? current : max;
+                  });
+
+                  imageUrl = bestUrl.url;
+                  dimensions = bestUrl.dims;
+                  method = "json-display-url";
+                  console.log("Found display_url from JSON:", imageUrl);
+                }
+              }
+            }
+          } catch (e) {
+            console.error("Error parsing Instagram JSON data:", e.message);
           }
         }
-      } catch (jsonError) {
-        console.log("Failed to parse _sharedData JSON");
-      }
+      });
     }
 
-    // Method 4: Look for other script tags with image data
-    const additionalDataRegex = /"display_url":"([^"]+)"/g;
-    const displayUrlMatch = additionalDataRegex.exec(html);
-    if (displayUrlMatch) {
-      const url = displayUrlMatch[1].replace(/\\u0026/g, "&");
-      console.log(`Found display_url: ${url}`);
-      return url;
-    }
-
-    console.log("No image found in page scraping");
-    return null;
-  } catch (error) {
-    console.error("Page scraping error:", error.message);
-    throw new Error("Failed to extract from page: " + error.message);
-  }
-}
-
-// Method 3: Simple fallback using oEmbed (Instagram's official embed API)
-async function extractFromOEmbed(instagramUrl) {
-  try {
-    console.log(`Trying oEmbed: ${instagramUrl}`);
-
-    const oembedUrl = `https://graph.facebook.com/v12.0/instagram_oembed?url=${encodeURIComponent(
-      instagramUrl
-    )}&access_token=your_access_token`;
-
-    // Since we don't have access token, try the basic oembed endpoint
-    const basicOembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(
-      instagramUrl
-    )}`;
-
-    const response = await axios.get(basicOembedUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      timeout: 10000,
-    });
-
-    const data = response.data;
-    if (data && data.thumbnail_url) {
-      console.log(`Found from oEmbed: ${data.thumbnail_url}`);
-      return data.thumbnail_url;
-    }
-
-    return null;
-  } catch (error) {
-    console.error("oEmbed error:", error.message);
-    // Don't throw error, let other methods try
-    return null;
-  }
-}
-
-// Main extraction function that tries multiple methods
-async function extractInstagramImage(instagramUrl) {
-  console.log(`Starting extraction for: ${instagramUrl}`);
-
-  const methods = [
-    { name: "Page Scraping", func: extractFromPage },
-    { name: "Embed", func: extractFromEmbed },
-    { name: "oEmbed", func: extractFromOEmbed },
-  ];
-
-  const errors = [];
-
-  for (const method of methods) {
-    try {
-      console.log(`Trying ${method.name} method...`);
-      const imageUrl = await method.func(instagramUrl);
+    // Method 5: Meta tags fallback
+    if (!imageUrl) {
+      const ogImage = $('meta[property="og:image"]').attr("content");
+      const twitterImage = $('meta[name="twitter:image"]').attr("content");
+      imageUrl = ogImage || twitterImage;
       if (imageUrl) {
-        console.log(`✓ Success with ${method.name} method: ${imageUrl}`);
-        return imageUrl;
-      } else {
-        console.log(`✗ ${method.name} method returned null`);
+        dimensions = extractDimensionsFromUrl(imageUrl);
+        method = "meta-tags";
+        console.log("Found image from meta tags:", imageUrl);
       }
-    } catch (error) {
-      const errorMsg = `${method.name} method failed: ${error.message}`;
-      console.log(`✗ ${errorMsg}`);
-      errors.push(errorMsg);
     }
-  }
-
-  console.log("All extraction methods failed");
-  throw new Error(
-    `All extraction methods failed. Errors: ${errors.join("; ")}`
-  );
-}
-
-// Routes
-app.get("/", (req, res) => {
-  res.json({
-    message: "Instagram Downloader API",
-    endpoints: {
-      "/api/download": "POST - Download Instagram image",
-      "/api/extract": "POST - Extract image URL only",
-    },
-  });
-});
-
-// Extract image URL endpoint
-app.post("/api/extract", rateLimit, async (req, res) => {
-  try {
-    const { url } = req.body;
-
-    console.log(`\n=== New extraction request ===`);
-    console.log(`URL: ${url}`);
-    console.log(`Time: ${new Date().toISOString()}`);
-    console.log(`IP: ${req.ip}`);
-
-    if (!url) {
-      console.log("❌ No URL provided");
-      return res.status(400).json({ error: "URL is required" });
-    }
-
-    if (!validateInstagramUrl(url)) {
-      console.log("❌ Invalid Instagram URL format");
-      return res
-        .status(400)
-        .json({
-          error:
-            "Invalid Instagram URL format. Please use: https://www.instagram.com/p/POST_ID/",
-        });
-    }
-
-    const imageUrl = await extractInstagramImage(url);
 
     if (!imageUrl) {
-      console.log("❌ No image found");
-      return res
-        .status(404)
-        .json({ error: "No image found at the provided URL" });
+      throw new Error("Could not extract image URL from Instagram post");
     }
 
-    console.log(`✅ Success! Image URL: ${imageUrl}`);
-    console.log(`=== End extraction request ===\n`);
+    // Clean up the URL to match exactly what Instagram serves
+    imageUrl = imageUrl.replace(/\\u0026/g, "&").replace(/\\/g, "");
 
-    res.json({
+    // Validate and enhance the URL to ensure we get the exact same image
+    const urlDimensions = extractDimensionsFromUrl(imageUrl);
+    const finalDimensions = dimensions.width > 0 ? dimensions : urlDimensions;
+
+    // Log the extraction details
+    console.log("✅ Successfully extracted image:", {
+      method,
+      url: imageUrl.substring(0, 80) + "...",
+      dimensions: finalDimensions,
+      isHighRes:
+        finalDimensions.width >= 1000 || finalDimensions.height >= 1000,
+    });
+
+    return {
+      imageUrl,
+      fullImageUrl: imageUrl,
+      highResUrl: imageUrl,
+      dimensions: finalDimensions,
+      method,
+      postId,
       success: true,
-      imageUrl: imageUrl,
-      originalUrl: url,
-      timestamp: new Date().toISOString(),
-    });
+    };
   } catch (error) {
-    console.error("❌ Extract error:", error.message);
-    console.log(`=== End extraction request (ERROR) ===\n`);
-
-    res.status(500).json({
-      error: "Failed to extract image: " + error.message,
-      details: process.env.NODE_ENV === "development" ? error.stack : undefined,
-    });
+    console.error("Error extracting Instagram image:", error.message);
+    throw new Error(`Failed to extract image: ${error.message}`);
   }
-});
+}
 
-// Download image endpoint
-app.post("/api/download", rateLimit, async (req, res) => {
+// Helper function to extract dimensions from URL
+function extractDimensionsFromUrl(url) {
+  const dimensionMatch = url.match(/(\d+)x(\d+)/);
+  if (dimensionMatch) {
+    return {
+      width: parseInt(dimensionMatch[1]),
+      height: parseInt(dimensionMatch[2]),
+    };
+  }
+  return { width: 0, height: 0 };
+}
+
+// API endpoint to extract Instagram image
+app.post("/api/extract", async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url, fullResolution, extractFullImage } = req.body;
 
     if (!url) {
-      return res.status(400).json({ error: "URL is required" });
+      return res.status(400).json({ error: "Instagram URL is required" });
     }
 
-    if (!validateInstagramUrl(url)) {
+    // Validate Instagram URL
+    const instagramRegex =
+      /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv)\/([A-Za-z0-9_-]+)\/?/;
+    if (!instagramRegex.test(url)) {
       return res.status(400).json({ error: "Invalid Instagram URL format" });
     }
 
-    // Extract image URL
-    const imageUrl = await extractInstagramImage(url);
+    console.log(`🔍 Extracting EXACT SAME IMAGE as browser shows for: ${url}`);
 
-    if (!imageUrl) {
-      return res
-        .status(404)
-        .json({ error: "No image found at the provided URL" });
-    }
+    const result = await extractInstagramImage(url);
 
-    // Fetch the image
-    const imageResponse = await axios.get(imageUrl, {
-      responseType: "stream",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      },
+    console.log("✅ Extraction successful:", {
+      method: result.method,
+      postId: result.postId,
+      dimensions: result.dimensions,
+      isHighRes:
+        result.dimensions.width >= 1000 || result.dimensions.height >= 1000,
+      urlPreview: result.imageUrl.substring(0, 100) + "...",
     });
 
-    // Set response headers for download
-    const filename = `instagram-image-${Date.now()}.jpg`;
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.setHeader("Content-Type", "image/jpeg");
-
-    // Pipe the image to response
-    imageResponse.data.pipe(res);
+    res.json({
+      ...result,
+      message: `Extracted using method: ${result.method}`,
+      extractedAt: new Date().toISOString(),
+    });
   } catch (error) {
-    console.error("Download error:", error);
+    console.error("❌ API Error:", error.message);
     res.status(500).json({
-      error: "Failed to download image: " + error.message,
-    });
-  }
-});
-
-// Test endpoint to debug extraction
-app.post("/api/test", async (req, res) => {
-  try {
-    const { url } = req.body;
-
-    if (!url) {
-      return res.status(400).json({ error: "URL is required" });
-    }
-
-    console.log(`Testing URL: ${url}`);
-
-    // Test basic connectivity
-    const testResults = {
-      url: url,
-      isValidFormat: validateInstagramUrl(url),
+      error: error.message,
+      success: false,
       timestamp: new Date().toISOString(),
-      methods: {},
-    };
-
-    // Test each method individually
-    const methods = [
-      { name: "Page Scraping", func: extractFromPage },
-      { name: "Embed", func: extractFromEmbed },
-      { name: "oEmbed", func: extractFromOEmbed },
-    ];
-
-    for (const method of methods) {
-      try {
-        console.log(`Testing ${method.name}...`);
-        const result = await method.func(url);
-        testResults.methods[method.name] = {
-          success: !!result,
-          result: result || "No image found",
-          error: null,
-        };
-      } catch (error) {
-        testResults.methods[method.name] = {
-          success: false,
-          result: null,
-          error: error.message,
-        };
-      }
-    }
-
-    res.json(testResults);
-  } catch (error) {
-    res.status(500).json({
-      error: "Test failed: " + error.message,
     });
   }
 });
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  res.json({
+    status: "OK",
+    message: "Instagram Full-Resolution Image Extractor API",
+    version: "1.0.0",
+  });
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  console.error("Server error:", error);
+  console.error("Unhandled error:", error);
   res.status(500).json({ error: "Internal server error" });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Instagram Downloader API running on port ${PORT}`);
-  console.log(`Visit http://localhost:${PORT} for API info`);
+  console.log(
+    `🚀 Instagram Full-Resolution Backend Server running on http://localhost:${PORT}`
+  );
+  console.log(`📸 Ready to extract full-quality Instagram images!`);
+  console.log(`🔍 Health check: http://localhost:${PORT}/health`);
 });
 
 module.exports = app;
